@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: options-dashboard
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn upstox_dashboard:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: DASH_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
