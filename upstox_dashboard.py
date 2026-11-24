@@ -30,6 +30,7 @@ app.config.update(
 DASH_PASSWORD = os.environ.get("DASH_PASSWORD", "")
 _expiry_cache = {}
 _fails = {}
+_hist = {}  # per index: today's OI/spot readings for the chart (memory only)
 
 LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Login</title><style>body{background:#0f1318;color:#e6e9ee;font:16px system-ui,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
@@ -214,6 +215,19 @@ def data():
 
     tot_ce, tot_pe = sum(r["ce_oi"] for r in rows), sum(r["pe_oi"] for r in rows)
     pcr = round(tot_pe / tot_ce, 2) if tot_ce else None
+
+    # record a reading for the OI vs index chart (resets each day / new expiry)
+    today_s = dt.datetime.now(IST).date().isoformat()
+    h = _hist.get(index)
+    if not h or h["date"] != today_s or h.get("expiry") != expiry:
+        h = _hist[index] = {"date": today_s, "expiry": expiry, "pts": []}
+    now_ts = time.time()
+    last = h["pts"][-1] if h["pts"] else None
+    changed = not last or (last["ce"], last["pe"], last["spot"]) != (tot_ce, tot_pe, spot)
+    if changed and (not last or now_ts - last["ts"] >= 25):
+        h["pts"].append({"ts": now_ts, "t": dt.datetime.now(IST).strftime("%H:%M"),
+                         "ce": tot_ce, "pe": tot_pe, "spot": spot})
+        del h["pts"][:-1500]
     atm = min(rows, key=lambda r: abs(r["strike"] - spot))
     res_row = max((r for r in rows if r["strike"] >= spot), key=lambda r: r["ce_oi"], default=None)
     sup_row = max((r for r in rows if r["strike"] <= spot), key=lambda r: r["pe_oi"], default=None)
@@ -270,7 +284,7 @@ def data():
         "atm": {"strike": atm["strike"], "ce_ltp": atm["ce_ltp"], "pe_ltp": atm["pe_ltp"],
                 "ce_delta": atm["ce_delta"], "pe_delta": atm["pe_delta"],
                 "ce_iv": atm["ce_iv"], "pe_iv": atm["pe_iv"]},
-        "chain": near,
+        "chain": near, "hist": h["pts"],
     })
 
     # trade idea
@@ -321,6 +335,13 @@ td,th{padding:3px 4px;text-align:right}th{color:var(--mut)}tr.atm{background:#23
 <div id="size" style="margin-top:6px"></div></div>
 </div>
 <div class="card" style="margin-top:10px"><h3>Option chain near ATM</h3><table id="chain"></table></div>
+<div class="card" style="margin-top:10px"><h3>Total call OI vs put OI vs index (today)</h3>
+<canvas id="cv" style="width:100%;height:260px;display:block"></canvas>
+<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;font-size:12px">
+<span><b style="color:#ef4444">&#9473;</b> Call OI (left)</span>
+<span><b style="color:#22c55e">&#9548;&#9548;</b> Put OI (left)</span>
+<span><b style="color:#60a5fa">&#9473;</b> Index (right)</span></div>
+<div class="mut" style="font-size:11px;margin-top:4px">Built from readings taken while this server is running, so it starts blank each day or after a restart. Rising put OI with a rising index, or rising call OI with a falling index, is the usual confirming pattern.</div></div>
 <p class="mut" style="font-size:11px">Decision support only. Not advice, no orders are placed. Verify lot size and signals yourself.</p>
 <script>
 const $=id=>document.getElementById(id);let D=null;
@@ -372,7 +393,30 @@ function render(d){D=d;$('stamp').textContent='Updated '+d.time;
   <td><b>${r.strike}</b></td><td>${f(r.pe_ltp,2)}</td>
   <td>${f(r.pe_oi)} <span class="bar" style="width:${r.pe_oi/mx*60}px;background:var(--g)"></span></td>
   <td class="${cls(r.pe_oi-r.pe_poi)}">${f(r.pe_oi-r.pe_poi)}</td></tr>`).join('');
- calc()}
+ drawChart(d.hist);calc()}
+let lastHist=[];
+function drawChart(pts){
+ lastHist=pts||[];const cv=$('cv');if(!cv)return;
+ const w=cv.clientWidth,h=cv.clientHeight,dpr=window.devicePixelRatio||1;
+ cv.width=w*dpr;cv.height=h*dpr;const x=cv.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+ x.font='11px system-ui';
+ if(lastHist.length<2){x.fillStyle='#8b95a3';x.fillText('Collecting readings... keep this page open (needs at least 2).',12,24);return}
+ const P=lastHist,n=P.length,L=54,R=54,T=10,B=22,pw=w-L-R,ph=h-T-B;
+ let a0=Math.min(...P.map(p=>Math.min(p.ce,p.pe))),a1=Math.max(...P.map(p=>Math.max(p.ce,p.pe)));
+ let s0=Math.min(...P.map(p=>p.spot)),s1=Math.max(...P.map(p=>p.spot));
+ const pad=(lo,hi)=>{const d=(hi-lo)||Math.max(Math.abs(hi)*0.002,1);return[lo-d*0.08,hi+d*0.08]};
+ [a0,a1]=pad(a0,a1);[s0,s1]=pad(s0,s1);
+ const X=i=>L+pw*i/(n-1),Yo=v=>T+ph*(1-(v-a0)/(a1-a0)),Ys=v=>T+ph*(1-(v-s0)/(s1-s0));
+ x.strokeStyle='#2b3440';x.fillStyle='#8b95a3';x.lineWidth=1;
+ for(let g=0;g<=4;g++){const y=T+ph*g/4;x.beginPath();x.moveTo(L,y);x.lineTo(L+pw,y);x.stroke();
+  x.textAlign='right';x.fillText((a1-(a1-a0)*g/4)/1e5>=100?((a1-(a1-a0)*g/4)/1e7).toFixed(2)+'Cr':((a1-(a1-a0)*g/4)/1e5).toFixed(1)+'L',L-6,y+4);
+  x.textAlign='left';x.fillText(f(s1-(s1-s0)*g/4),L+pw+6,y+4)}
+ x.textAlign='center';[0,Math.floor((n-1)/2),n-1].forEach(i=>x.fillText(P[i].t,X(i),h-6));
+ const line=(key,Y,col,wd,dash)=>{x.beginPath();x.strokeStyle=col;x.lineWidth=wd;x.setLineDash(dash);
+  P.forEach((p,i)=>{const px=X(i),py=Y(p[key]);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke();x.setLineDash([])};
+ line('ce',Yo,'#ef4444',2,[]);line('pe',Yo,'#22c55e',2,[6,4]);line('spot',Ys,'#60a5fa',2.5,[]);
+}
+window.addEventListener('resize',()=>drawChart(lastHist));
 async function saveTok(){const t=$('tok').value.trim();if(!t)return;
  try{await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});$('tok').value='';load()}catch(e){$('err').textContent=String(e)}}
 async function load(){try{const r=await fetch('/api/data?index='+$('idx').value);
