@@ -8,7 +8,7 @@ Upstox access tokens expire daily (~3:30 AM IST).
 """
 import os, time, hmac, secrets, json, re, zlib, codecs, threading, datetime as dt
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlparse, parse_qs
 import requests
 from flask import Flask, jsonify, request, Response, session, redirect
 
@@ -79,10 +79,86 @@ def logout():
     return redirect("/login")
 
 
+API_KEY = os.environ.get("UPSTOX_API_KEY", "").strip()
+API_SECRET = os.environ.get("UPSTOX_API_SECRET", "").strip()
+
+
+def redirect_uri():
+    env = os.environ.get("UPSTOX_REDIRECT_URI", "").strip()
+    if env:
+        return env
+    scheme = "https" if os.environ.get("PORT") else request.scheme
+    return f"{scheme}://{request.host}/callback"
+
+
+def exchange_code(code):
+    """Swap the one-time login code for today's access token (valid until ~3:30 AM)."""
+    global TOKEN
+    if not (API_KEY and API_SECRET):
+        raise RuntimeError("Add UPSTOX_API_KEY and UPSTOX_API_SECRET in Render > Environment first")
+    r = requests.post(
+        BASE + "/login/authorization/token",
+        data={"code": code, "client_id": API_KEY, "client_secret": API_SECRET,
+              "redirect_uri": redirect_uri(), "grant_type": "authorization_code"},
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Upstox login failed (HTTP {r.status_code}): {r.text[:200]}")
+    tok = (r.json() or {}).get("access_token")
+    if not tok:
+        raise RuntimeError("Upstox returned no access token")
+    TOKEN = tok
+    _expiry_cache.clear()
+    _scan["ts"] = 0.0
+
+
+def _msg_page(text):
+    safe = str(text).replace("<", "&lt;")
+    return Response("<body style='background:#0f1318;color:#e6e9ee;font:16px system-ui;padding:20px'>"
+                    f"<p>{safe}</p><p><a style='color:#60a5fa' href='/'>Back to dashboard</a></p></body>",
+                    mimetype="text/html")
+
+
+@app.route("/upstox/login")
+def upstox_login():
+    if not API_KEY:
+        return _msg_page("Add UPSTOX_API_KEY and UPSTOX_API_SECRET in Render > Environment first.")
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    return redirect("https://api.upstox.com/v2/login/authorization/dialog?" + urlencode(
+        {"client_id": API_KEY, "redirect_uri": redirect_uri(), "response_type": "code", "state": state}))
+
+
+@app.route("/callback")
+def callback():
+    code = request.args.get("code")
+    if not code:
+        return _msg_page("Upstox did not send a login code: " + (request.args.get("error_description") or request.args.get("error") or "unknown reason"))
+    st = request.args.get("state")
+    if st and st != session.get("oauth_state"):
+        return _msg_page("Login check failed (state mismatch). Tap Login with Upstox again.")
+    try:
+        exchange_code(code)
+    except Exception as e:
+        return _msg_page(e)
+    return redirect("/")
+
+
 @app.route("/token", methods=["POST"])
 def set_token():
     global TOKEN
-    TOKEN = ((request.get_json(silent=True) or {}).get("token") or "").strip()
+    raw = ((request.get_json(silent=True) or {}).get("token") or "").strip()
+    if "code=" in raw:  # user pasted the whole redirect address after logging in
+        try:
+            m = re.search(r"[?&]code=([^&\s]+)", raw)
+            if not m:
+                raise RuntimeError("Could not find the code in that address")
+            exchange_code(m.group(1))
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "msg": str(e)})
+    TOKEN = re.sub(r"^bearer\s+", "", raw, flags=re.I).strip("\"' ")
     _expiry_cache.clear()
     return jsonify({"ok": bool(TOKEN)})
 
@@ -357,9 +433,9 @@ td,th{padding:3px 4px;text-align:right}th{color:var(--mut)}tr.atm{background:#23
 .bar{display:inline-block;height:8px;border-radius:2px}.warn{background:#3a1d1d;border:1px solid var(--r);padding:10px;border-radius:8px;margin-bottom:10px;display:none;font-weight:600}
 .err{color:var(--y);font-size:12px}
 </style></head><body>
-<div class="top"><b>Options Dashboard</b> <a href="/scanner" style="color:#60a5fa">Stock scanner</a>
+<div class="top"><b>Options Dashboard</b> <a href="/scanner" style="color:#60a5fa">Stock scanner</a> <a href="/upstox/login" style="color:#eab308;font-weight:600">Login with Upstox</a>
 <select id="idx"><option>NIFTY</option><option>BANKNIFTY</option><option>SENSEX</option></select>
-<input id="tok" type="password" placeholder="Today's Upstox token" style="width:170px"><button id="sv" onclick="saveTok()" style="background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px">Save</button>
+<input id="tok" type="password" placeholder="Token or login URL" style="width:170px"><button id="sv" onclick="saveTok()" style="background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px">Save</button>
 <span class="mut" id="stamp"></span><a href="/logout" class="mut" style="margin-left:auto">Log out</a></div>
 <div class="warn" id="halt">DAILY LOSS LIMIT HIT. Stop trading for today.</div>
 <div class="err" id="err"></div>
@@ -400,7 +476,7 @@ function calc(){
  $('halt').style.display=(+$('pnl').value<=-Math.abs($('mdl').value))?'block':'none';
 }
 function render(d){D=d;$('stamp').textContent='Updated '+d.time;
- $('err').textContent=(d.errors||[]).join(' | ');
+ $('err').textContent=(d.errors||[]).join(' | ')+((d.errors||[]).join().includes('HTTP 401')?'   >> Tap "Login with Upstox" at the top.':'');
  if(!d.spot)return;
  const c=d.score>=3?'g':d.score<=-3?'r':'y';
  $('bias').innerHTML=`<span class="${c}">${d.bias}</span>`;
@@ -460,7 +536,7 @@ function drawChart(pts){
 }
 window.addEventListener('resize',()=>drawChart(lastHist));
 async function saveTok(){const t=$('tok').value.trim();if(!t)return;
- try{await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});$('tok').value='';load()}catch(e){$('err').textContent=String(e)}}
+ try{const r=await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});const j=await r.json();$('tok').value='';if(j.ok===false)$('err').textContent=j.msg||'Could not save';else load()}catch(e){$('err').textContent=String(e)}}
 async function load(){try{const r=await fetch('/api/data?index='+$('idx').value);
  if(r.status===401){location='/login';return}render(await r.json())}catch(e){$('err').textContent=String(e)}}
 $('idx').addEventListener('change',load);load();setInterval(load,10000);
@@ -817,8 +893,8 @@ table{width:100%;border-collapse:collapse;font-size:13px;min-width:720px}td,th{p
 tr.rw{cursor:pointer;border-top:1px solid #232c38}tr.rw:hover{background:#1d2530}tr.dt td{background:#141a21;white-space:normal;padding:8px 12px;font-size:12px}
 .err{color:var(--y);font-size:12px;margin-bottom:6px}button{background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px}
 </style></head><body>
-<div class="top"><b>Nifty 50 Scanner</b><a href="/" style="color:#60a5fa">Options dashboard</a>
-<input id="tok" type="password" placeholder="Today's Upstox token" style="width:170px"><button onclick="saveTok()">Save</button>
+<div class="top"><b>Nifty 50 Scanner</b><a href="/" style="color:#60a5fa">Options dashboard</a> <a href="/upstox/login" style="color:#eab308;font-weight:600">Login with Upstox</a>
+<input id="tok" type="password" placeholder="Token or login URL" style="width:170px"><button onclick="saveTok()">Save</button>
 <select id="flt"><option value="all">All stocks</option><option value="bull">Bullish only</option><option value="bear">Bearish only</option></select>
 <select id="srt"><option value="score_d">Score: high to low</option><option value="score_a">Score: low to high</option>
 <option value="chg_d">Change: high to low</option><option value="chg_a">Change: low to high</option><option value="rvol">Volume spike first</option></select>
@@ -858,11 +934,11 @@ function render(){
 $('tb').addEventListener('click',e=>{const tr=e.target.closest('tr.rw');if(!tr)return;const s=tr.dataset.s;openS.has(s)?openS.delete(s):openS.add(s);render()});
 $('flt').addEventListener('change',render);$('srt').addEventListener('change',render);
 async function saveTok(){const t=$('tok').value.trim();if(!t)return;
- try{await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});$('tok').value='';load()}catch(e){$('err').textContent=String(e)}}
+ try{const r=await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});const j=await r.json();$('tok').value='';if(j.ok===false)$('err').textContent=j.msg||'Could not save';else load()}catch(e){$('err').textContent=String(e)}}
 async function load(){clearTimeout(timer);
  try{const r=await fetch('/api/scan');if(r.status===401){location='/login';return}
   const d=await r.json();if(d.rows){D=d;render()}
-  $('err').textContent=(d.errors||[]).join(' | ');
+  $('err').textContent=(d.errors||[]).join(' | ')+((d.errors||[]).join().includes('HTTP 401')?'   >> Tap "Login with Upstox" at the top.':'');
   $('stamp').textContent=d.running?(d.progress||'Scanning...'):(d.asof?'Updated '+d.asof+' | last candle '+d.last_candle+' | session '+d.session:'');
   timer=setTimeout(load,d.running?3000:(d.rows?30000:10000))
  }catch(e){$('err').textContent=String(e);timer=setTimeout(load,10000)}}
