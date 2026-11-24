@@ -802,7 +802,8 @@ def analyze(sym, cs):
         "vwap": r2(vwap), "vwap_pct": r2((last / vwap - 1) * 100), "vside": 1 if last > vwap else -1 if last < vwap else 0,
         "st": sdir, "st_val": r2(stv[-1]) if stv else None, "flip": flip,
         "pctb": r2(pctb, 3), "bb": [r2(lo), r2(mid), r2(up)], "squeeze": squeeze,
-        "rvol": r2(rvol, 1), "rsi": r2(r14, 1), "e9": r2(e9), "e21": r2(e21),
+        "rvol": r2(rvol, 1), "rsi": r2(r14, 1),
+        "dvol": int(sum(x[5] for x in today_c)), "lvol": int(today_c[-1][5]), "e9": r2(e9), "e21": r2(e21),
         "pdh": r2(pdh), "pdl": r2(pdl), "why": why, "t": cs[-1][0][11:16], "session": sess,
     }
 
@@ -889,7 +890,7 @@ select,input{background:#0f1318;color:var(--tx);border:1px solid #2b3440;border-
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
 .card{background:var(--card);border-radius:10px;padding:12px}.card h3{margin:0 0 8px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
 .big{font-size:24px;font-weight:700}.mut{color:var(--mut)}.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}
-table{width:100%;border-collapse:collapse;font-size:13px;min-width:720px}td,th{padding:6px 6px;text-align:right;white-space:nowrap}th{color:var(--mut);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:960px}td,th{padding:6px 6px;text-align:right;white-space:nowrap}th{color:var(--mut);font-weight:600}
 tr.rw{cursor:pointer;border-top:1px solid #232c38}tr.rw:hover{background:#1d2530}tr.dt td{background:#141a21;white-space:normal;padding:8px 12px;font-size:12px}
 .err{color:var(--y);font-size:12px;margin-bottom:6px}button{background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px}
 </style></head><body>
@@ -897,7 +898,7 @@ tr.rw{cursor:pointer;border-top:1px solid #232c38}tr.rw:hover{background:#1d2530
 <input id="tok" type="password" placeholder="Token or login URL" style="width:170px"><button onclick="saveTok()">Save</button>
 <select id="flt"><option value="all">All stocks</option><option value="bull">Bullish only</option><option value="bear">Bearish only</option></select>
 <select id="srt"><option value="score_d">Score: high to low</option><option value="score_a">Score: low to high</option>
-<option value="chg_d">Change: high to low</option><option value="chg_a">Change: low to high</option><option value="rvol">Volume spike first</option></select>
+<option value="chg_d">Change: high to low</option><option value="chg_a">Change: low to high</option><option value="rvol">Volume spike first</option><option value="dvol">Day volume: high to low</option></select>
 <span class="mut" id="stamp"></span><a href="/logout" class="mut" style="margin-left:auto">Log out</a></div>
 <div class="err" id="err"></div>
 <div class="grid" id="sum"></div>
@@ -907,6 +908,7 @@ tr.rw{cursor:pointer;border-top:1px solid #232c38}tr.rw:hover{background:#1d2530
 const $=id=>document.getElementById(id);let D=null,openS=new Set(),timer=null;
 function f(n,d=0){return n==null?'-':Number(n).toLocaleString('en-IN',{maximumFractionDigits:d})}
 function cls(n){return n>0?'g':n<0?'r':''}
+function fv(n){if(n==null)return '-';if(n>=1e7)return (n/1e7).toFixed(2)+' Cr';if(n>=1e5)return (n/1e5).toFixed(2)+' L';if(n>=1e3)return (n/1e3).toFixed(1)+' K';return String(n)}
 function sg(r){const s=r.score;return s>=6?['STRONG BULL','g']:s>=4?['BULL','g']:s<=-6?['STRONG BEAR','r']:s<=-4?['BEAR','r']:['NEUTRAL','y']}
 function render(){
  if(!D||!D.rows)return;const s=D.summary;
@@ -917,16 +919,16 @@ function render(){
  <div class="card" style="grid-column:1/-1"><h3>Breadth read</h3>${s.read}</div>`;
  let rows=D.rows.slice();const fl=$('flt').value;
  if(fl==='bull')rows=rows.filter(r=>r.score>=4);else if(fl==='bear')rows=rows.filter(r=>r.score<=-4);
- const key={score_d:r=>-r.score,score_a:r=>r.score,chg_d:r=>-r.chg,chg_a:r=>r.chg,rvol:r=>-(r.rvol||0)}[$('srt').value];
+ const key={score_d:r=>-r.score,score_a:r=>r.score,chg_d:r=>-r.chg,chg_a:r=>r.chg,rvol:r=>-(r.rvol||0),dvol:r=>-(r.dvol||0)}[$('srt').value];
  rows.sort((a,b)=>key(a)-key(b));
- let h='<tr><th style="text-align:left">Stock</th><th>LTP</th><th>Chg %</th><th>Score</th><th>Signal</th><th>VWAP</th><th>Supertrend</th><th>BB %B</th><th>Vol</th><th>RSI</th></tr>';
+ let h='<tr><th style="text-align:left">Stock</th><th>LTP</th><th>Chg %</th><th>Score</th><th>Signal</th><th>VWAP</th><th>Supertrend</th><th>BB %B</th><th>Day volume</th><th>Last 5m vol</th><th>Vol vs normal</th><th>RSI</th></tr>';
  for(const r of rows){const [t,c]=sg(r);
   h+=`<tr class="rw" data-s="${r.sym}"><td style="text-align:left"><b>${r.sym}</b></td><td>${f(r.ltp,2)}</td><td class="${cls(r.chg)}">${f(r.chg,2)}</td>
   <td><b class="${cls(r.score)}">${r.score>0?'+':''}${r.score}</b></td><td class="${c}">${t}</td>
   <td class="${cls(r.vside)}">${r.vside>0?'above':r.vside<0?'below':'at'} ${f(Math.abs(r.vwap_pct),2)}%</td>
   <td class="${cls(r.st)}">${r.st>0?'Up':'Down'}${r.flip?' (new)':''}</td>
-  <td>${f(r.pctb*100)}%${r.squeeze?' SQZ':''}</td><td>${r.rvol==null?'-':f(r.rvol,1)+'x'}</td><td>${f(r.rsi)}</td></tr>`;
-  if(openS.has(r.sym))h+=`<tr class="dt"><td colspan="10" style="text-align:left">`+
+  <td>${f(r.pctb*100)}%${r.squeeze?' SQZ':''}</td><td>${fv(r.dvol)}</td><td>${fv(r.lvol)}</td><td>${r.rvol==null?'-':f(r.rvol,1)+'x'}</td><td>${f(r.rsi)}</td></tr>`;
+  if(openS.has(r.sym))h+=`<tr class="dt"><td colspan="12" style="text-align:left">`+
    r.why.map(w=>`<div><b class="${cls(w[0])}">${w[0]>0?'+':''}${w[0]}</b> ${w[1]}</div>`).join('')+
    `<div class="mut" style="margin-top:6px">VWAP ${f(r.vwap,2)} | EMA9 ${f(r.e9,2)} / EMA21 ${f(r.e21,2)} | Supertrend ${f(r.st_val,2)} | Bollinger ${f(r.bb[0],2)} / ${f(r.bb[1],2)} / ${f(r.bb[2],2)} | Prev day high ${f(r.pdh,2)} low ${f(r.pdl,2)}</div></td></tr>`;
  }
