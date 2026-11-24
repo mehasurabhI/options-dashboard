@@ -6,7 +6,8 @@ Required env vars: DASH_PASSWORD (your login password), SECRET_KEY (random).
 Each morning: log in, paste today's Upstox access token in the box at the top.
 Upstox access tokens expire daily (~3:30 AM IST).
 """
-import os, time, hmac, secrets, datetime as dt
+import os, time, hmac, secrets, json, re, zlib, codecs, threading, datetime as dt
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 import requests
 from flask import Flask, jsonify, request, Response, session, redirect
@@ -86,9 +87,9 @@ def set_token():
     return jsonify({"ok": bool(TOKEN)})
 
 
-def api(path, params=None):
+def api(path, params=None, base=BASE):
     r = requests.get(
-        BASE + path,
+        base + path,
         params=params,
         headers={"Accept": "application/json", "Authorization": "Bearer " + TOKEN},
         timeout=10,
@@ -315,7 +316,7 @@ td,th{padding:3px 4px;text-align:right}th{color:var(--mut)}tr.atm{background:#23
 .bar{display:inline-block;height:8px;border-radius:2px}.warn{background:#3a1d1d;border:1px solid var(--r);padding:10px;border-radius:8px;margin-bottom:10px;display:none;font-weight:600}
 .err{color:var(--y);font-size:12px}
 </style></head><body>
-<div class="top"><b>Options Dashboard</b>
+<div class="top"><b>Options Dashboard</b> <a href="/scanner" style="color:#60a5fa">Stock scanner</a>
 <select id="idx"><option>NIFTY</option><option>BANKNIFTY</option><option>SENSEX</option></select>
 <input id="tok" type="password" placeholder="Today's Upstox token" style="width:170px"><button id="sv" onclick="saveTok()" style="background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px">Save</button>
 <span class="mut" id="stamp"></span><a href="/logout" class="mut" style="margin-left:auto">Log out</a></div>
@@ -423,6 +424,381 @@ async function load(){try{const r=await fetch('/api/data?index='+$('idx').value)
  if(r.status===401){location='/login';return}render(await r.json())}catch(e){$('err').textContent=String(e)}}
 $('idx').addEventListener('change',load);load();setInterval(load,10000);
 </script></body></html>"""
+
+
+# ======================= Nifty 50 scanner =======================
+BASE3 = "https://api.upstox.com/v3"
+INSTR_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+# Nifty 50 after the 30-Sep-2026 rebalance (BSE in, Wipro out). The index changes every
+# March/September: set env var SCAN_SYMBOLS=SYM1,SYM2,... on Render to override without editing code.
+NIFTY50 = [
+    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BSE", "BAJAJ-AUTO",
+    "BAJFINANCE", "BAJAJFINSV", "BEL", "BHARTIARTL", "CIPLA", "COALINDIA", "DRREDDY",
+    "EICHERMOT", "ETERNAL", "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HINDALCO",
+    "HINDUNILVR", "ICICIBANK", "ITC", "INFY", "INDIGO", "JSWSTEEL", "JIOFIN", "KOTAKBANK",
+    "LT", "M&M", "MARUTI", "MAXHEALTH", "NTPC", "NESTLEIND", "ONGC", "POWERGRID", "RELIANCE",
+    "SBILIFE", "SHRIRAMFIN", "SBIN", "SUNPHARMA", "TCS", "TATACONSUM", "TMPV", "TATASTEEL",
+    "TECHM", "TITAN", "TRENT", "ULTRACEMCO",
+]
+SYMBOLS = [s.strip() for s in os.environ.get("SCAN_SYMBOLS", "").split(",") if s.strip()] or NIFTY50
+SCAN_TTL = 90  # seconds between full rescans (keeps well inside Upstox rate limits)
+_uni = {"date": None, "map": {}, "missing": []}
+_hist5 = {"date": None, "c": {}}
+_scan = {"ts": 0.0, "data": None, "running": False, "progress": "", "err": None}
+_scan_lock = threading.Lock()
+
+
+def norm(s):
+    return re.sub(r"[^A-Z0-9&]", "", s.upper())
+
+
+def _open_instruments():
+    return requests.get(INSTR_URL, stream=True, timeout=120)
+
+
+def _iter_json_array_gz(resp):
+    """Stream objects out of a big gzipped JSON array without loading it all in memory."""
+    dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    txt = codecs.getincrementaldecoder("utf-8")("ignore")
+    jd = json.JSONDecoder()
+    buf = ""
+    for chunk in resp.raw.stream(1 << 16, decode_content=False):
+        buf += txt.decode(dec.decompress(chunk))
+        i, n = 0, len(buf)
+        while True:
+            while i < n and buf[i] in " \r\n\t,[":
+                i += 1
+            if i >= n or buf[i] == "]":
+                break
+            try:
+                obj, i = jd.raw_decode(buf, i)
+            except ValueError:
+                break  # object continues in the next chunk
+            yield obj
+        buf = buf[i:]
+
+
+def load_universe():
+    today = dt.datetime.now(IST).date().isoformat()
+    if _uni["date"] == today and _uni["map"]:
+        return
+    want = {norm(s): s for s in SYMBOLS}
+    found = {}
+    r = _open_instruments()
+    r.raise_for_status()
+    try:
+        for o in _iter_json_array_gz(r):
+            if o.get("segment") != "NSE_EQ":
+                continue
+            ts = norm(o.get("trading_symbol", ""))
+            if ts in want and ts not in found and o.get("instrument_key"):
+                found[ts] = o["instrument_key"]
+                if len(found) == len(want):
+                    break
+    finally:
+        r.close()
+    _uni.update(date=today, map={want[k]: v for k, v in found.items()},
+                missing=[want[k] for k in want if k not in found])
+
+
+def parse_c(raw):
+    out = [[x[0], float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5] or 0)] for x in raw]
+    out.reverse()  # API returns newest first
+    return out
+
+
+def fetch_candles(key):
+    k = quote(key, safe="")
+    today = dt.datetime.now(IST).date()
+    hc = _hist5["c"].get(key)
+    if hc is None:  # past sessions: fetched once per day
+        to_d = (today - dt.timedelta(days=1)).isoformat()
+        from_d = (today - dt.timedelta(days=8)).isoformat()
+        d = api(f"/historical-candle/{k}/minutes/5/{to_d}/{from_d}", base=BASE3)
+        hc = parse_c((d or {}).get("candles", []))
+        _hist5["c"][key] = hc
+    d = api(f"/historical-candle/intraday/{k}/minutes/5", base=BASE3)
+    ic = parse_c((d or {}).get("candles", []))
+    merged = {c[0]: c for c in hc + ic}
+    return [merged[t] for t in sorted(merged)]
+
+
+def supertrend(h, l, c, period=10, mult=3.0):
+    n = len(c)
+    if n < period + 2:
+        return None, None
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, n)]
+    atr = [None] * n
+    a = sum(tr[:period]) / period
+    atr[period - 1] = a
+    for i in range(period, n):
+        a = (a * (period - 1) + tr[i]) / period
+        atr[i] = a
+    dirs, st = [0] * n, [None] * n
+    fu = fl = None
+    d = 1
+    for i in range(period - 1, n):
+        hl2 = (h[i] + l[i]) / 2
+        bu, bl = hl2 + mult * atr[i], hl2 - mult * atr[i]
+        if fu is None:
+            fu, fl = bu, bl
+            d = 1 if c[i] >= hl2 else -1
+        else:
+            fu = bu if (bu < fu or c[i - 1] > fu) else fu
+            fl = bl if (bl > fl or c[i - 1] < fl) else fl
+            if d == -1 and c[i] > fu:
+                d = 1
+            elif d == 1 and c[i] < fl:
+                d = -1
+        dirs[i] = d
+        st[i] = fl if d == 1 else fu
+    return dirs, st
+
+
+def boll_at(closes, end, n=20, k=2.0):
+    w = closes[end - n:end]
+    m = sum(w) / n
+    sd = (sum((x - m) ** 2 for x in w) / n) ** 0.5
+    return m, m + k * sd, m - k * sd
+
+
+def analyze(sym, cs):
+    now = dt.datetime.now(IST)
+    if cs and cs[-1][0][:10] == now.date().isoformat():
+        try:
+            if dt.datetime.fromisoformat(cs[-1][0]) + dt.timedelta(minutes=5) > now:
+                cs = cs[:-1]  # drop the still-forming candle
+        except ValueError:
+            pass
+    if len(cs) < 40:
+        return None
+    sess = cs[-1][0][:10]
+    i0 = next(i for i, c in enumerate(cs) if c[0][:10] == sess)
+    today_c, prior = cs[i0:], cs[:i0]
+    if not prior:
+        return None
+    o_, h_, l_, c_, v_ = ([x[j] for x in cs] for j in (1, 2, 3, 4, 5))
+    last = c_[-1]
+    prev_day = prior[-1][0][:10]
+    pday = [x for x in prior if x[0][:10] == prev_day]
+    pdh, pdl, pclose = max(x[2] for x in pday), min(x[3] for x in pday), pday[-1][4]
+    chg = (last / pclose - 1) * 100 if pclose else 0
+
+    e9, e21 = ema(c_, 9)[-1], ema(c_, 21)[-1]
+    r14 = rsi(c_) or 50
+    pv = vv = 0.0
+    for x in today_c:
+        pv += (x[2] + x[3] + x[4]) / 3 * x[5]
+        vv += x[5]
+    vwap = pv / vv if vv > 0 else last
+    dirs, stv = supertrend(h_, l_, c_)
+    sdir = dirs[-1] if dirs else 0
+    flip = bool(dirs) and any(dirs[i] != dirs[i - 1] for i in range(len(dirs) - 3, len(dirs)))
+    mid, up, lo = boll_at(c_, len(c_))
+    pctb = (last - lo) / (up - lo) if up > lo else 0.5
+    bws = []
+    for j in range(max(20, len(c_) - 100), len(c_) + 1):
+        m, u2, l2 = boll_at(c_, j)
+        bws.append((u2 - l2) / m if m else 0)
+    squeeze = len(bws) >= 30 and bws[-1] <= sorted(bws)[int(0.2 * len(bws))]
+
+    # volume vs the same time-of-day slot on earlier sessions
+    pdates = sorted({x[0][:10] for x in prior})[-5:]
+    slots = {}
+    for x in prior:
+        if x[0][:10] in pdates:
+            slots.setdefault(x[0][11:16], []).append(x[5])
+    ratios = []
+    for x in today_c[-2:]:
+        s = slots.get(x[0][11:16])
+        if s and sum(s) > 0:
+            ratios.append(x[5] / (sum(s) / len(s)))
+    rvol = sum(ratios) / len(ratios) if ratios else None
+
+    sc, why = 0, []
+
+    def add(p, t):
+        nonlocal sc
+        sc += p
+        why.append([p, t])
+
+    if last > e21 and e9 > e21: add(1, "Price above EMA21 and EMA9 > EMA21 (uptrend)")
+    elif last < e21 and e9 < e21: add(-1, "Price below EMA21 and EMA9 < EMA21 (downtrend)")
+    else: add(0, "EMAs mixed")
+    if r14 > 58: add(1, f"RSI {r14:.0f} (bullish momentum)")
+    elif r14 < 42: add(-1, f"RSI {r14:.0f} (bearish momentum)")
+    else: add(0, f"RSI {r14:.0f} (neutral)")
+    if last > vwap: add(1, f"Above VWAP {vwap:.2f}")
+    elif last < vwap: add(-1, f"Below VWAP {vwap:.2f}")
+    else: add(0, "At VWAP")
+    if sdir > 0: add(1, "Supertrend(10,3) up" + (" - flipped recently" if flip else ""))
+    elif sdir < 0: add(-1, "Supertrend(10,3) down" + (" - flipped recently" if flip else ""))
+    else: add(0, "Supertrend n/a")
+    if pctb >= 0.8: add(1, f"Bollinger %B {pctb*100:.0f}% (riding upper band)" + (", squeeze" if squeeze else ""))
+    elif pctb <= 0.2: add(-1, f"Bollinger %B {pctb*100:.0f}% (riding lower band)" + (", squeeze" if squeeze else ""))
+    else: add(0, f"Bollinger %B {pctb*100:.0f}% (mid-range)" + (", squeeze" if squeeze else ""))
+    if last > pdh: add(1, f"Above previous day high {pdh:.2f}")
+    elif last < pdl: add(-1, f"Below previous day low {pdl:.2f}")
+    else: add(0, "Inside previous day range")
+    move = today_c[-1][4] - (today_c[-2][1] if len(today_c) >= 2 else today_c[-1][1])
+    if rvol is not None and rvol >= 1.5 and move > 0: add(1, f"Volume {rvol:.1f}x normal on rising price")
+    elif rvol is not None and rvol >= 1.5 and move < 0: add(-1, f"Volume {rvol:.1f}x normal on falling price")
+    else: add(0, "Volume not unusual" if rvol is not None else "Volume baseline n/a")
+
+    sig = "STRONG BULL" if sc >= 6 else "BULL" if sc >= 4 else "STRONG BEAR" if sc <= -6 else "BEAR" if sc <= -4 else "NEUTRAL"
+    r2 = lambda x, n=2: None if x is None else round(x, n)
+    return {
+        "sym": sym, "ltp": r2(last), "chg": r2(chg), "score": sc, "sig": sig,
+        "vwap": r2(vwap), "vwap_pct": r2((last / vwap - 1) * 100), "vside": 1 if last > vwap else -1 if last < vwap else 0,
+        "st": sdir, "st_val": r2(stv[-1]) if stv else None, "flip": flip,
+        "pctb": r2(pctb, 3), "bb": [r2(lo), r2(mid), r2(up)], "squeeze": squeeze,
+        "rvol": r2(rvol, 1), "rsi": r2(r14, 1), "e9": r2(e9), "e21": r2(e21),
+        "pdh": r2(pdh), "pdl": r2(pdl), "why": why, "t": cs[-1][0][11:16], "session": sess,
+    }
+
+
+def _scan_worker():
+    try:
+        _scan["err"] = None
+        _scan["progress"] = "Loading instrument list..."
+        load_universe()
+        if not _uni["map"]:
+            raise RuntimeError("None of the Nifty 50 symbols were found in the Upstox instrument list")
+        today = dt.datetime.now(IST).date().isoformat()
+        if _hist5["date"] != today:
+            _hist5.update(date=today, c={})
+        items = list(_uni["map"].items())
+        res, errs, done = [], [], [0]
+
+        def work(it):
+            sym, key = it
+            try:
+                a = analyze(sym, fetch_candles(key))
+                if a: res.append(a)
+                else: errs.append(f"{sym}: not enough candles")
+            except Exception as e:
+                errs.append(f"{sym}: {str(e)[:90]}")
+            done[0] += 1
+            _scan["progress"] = f"Scanning {done[0]}/{len(items)}"
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            list(ex.map(work, items))
+        if not res:
+            raise RuntimeError(errs[0] if errs else "No data returned")
+        res.sort(key=lambda r: -r["score"])
+        n = len(res)
+        bull = sum(1 for r in res if r["score"] >= 4)
+        bear = sum(1 for r in res if r["score"] <= -4)
+        pct = lambda fn: round(100 * sum(1 for r in res if fn(r)) / n)
+        sm = {"n": n, "bull": bull, "bear": bear, "neutral": n - bull - bear,
+              "above_vwap": pct(lambda r: r["vside"] > 0), "st_up": pct(lambda r: r["st"] > 0),
+              "adv": sum(1 for r in res if r["chg"] > 0), "dec": sum(1 for r in res if r["chg"] < 0)}
+        if bull >= 2 * max(bear, 1) and sm["above_vwap"] >= 65:
+            sm["read"] = "Breadth leans bullish: supports CE-side index setups. Confirm on the index itself."
+        elif bear >= 2 * max(bull, 1) and sm["above_vwap"] <= 35:
+            sm["read"] = "Breadth leans bearish: supports PE-side index setups. Confirm on the index itself."
+        else:
+            sm["read"] = "Mixed breadth: no broad edge from the stocks right now."
+        now = dt.datetime.now(IST)
+        _scan["data"] = {"rows": res, "summary": sm, "missing": _uni["missing"],
+                         "asof": now.strftime("%H:%M:%S"), "session": max(r["session"] for r in res),
+                         "last_candle": max(r["t"] for r in res), "failed": errs[:5]}
+        _scan["ts"] = time.time()
+        if errs:
+            _scan["err"] = f"{len(errs)} stocks failed, e.g. {errs[0]}"
+    except Exception as e:
+        _scan["err"] = str(e)[:200]
+        _scan["ts"] = time.time() - SCAN_TTL + 30  # retry in ~30s
+    finally:
+        _scan["running"] = False
+
+
+@app.route("/api/scan")
+def scan_api():
+    if not TOKEN:
+        return jsonify({"errors": ["Paste today's Upstox access token in the box at the top and tap Save"]})
+    with _scan_lock:
+        if not _scan["running"] and time.time() - _scan["ts"] > SCAN_TTL:
+            _scan["running"] = True
+            _scan["progress"] = "Starting..."
+            threading.Thread(target=_scan_worker, daemon=True).start()
+        running = _scan["running"]
+    out = dict(_scan["data"] or {})
+    out["running"] = running
+    out["progress"] = _scan["progress"]
+    out["errors"] = [_scan["err"]] if _scan["err"] else []
+    return jsonify(out)
+
+
+SCAN_HTML = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Nifty 50 Scanner</title><style>
+:root{--bg:#0f1318;--card:#181e26;--tx:#e6e9ee;--mut:#8b95a3;--g:#22c55e;--r:#ef4444;--y:#eab308}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px system-ui,sans-serif;padding:12px}
+.top{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+select,input{background:#0f1318;color:var(--tx);border:1px solid #2b3440;border-radius:6px;padding:6px 8px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
+.card{background:var(--card);border-radius:10px;padding:12px}.card h3{margin:0 0 8px;font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em}
+.big{font-size:24px;font-weight:700}.mut{color:var(--mut)}.g{color:var(--g)}.r{color:var(--r)}.y{color:var(--y)}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:720px}td,th{padding:6px 6px;text-align:right;white-space:nowrap}th{color:var(--mut);font-weight:600}
+tr.rw{cursor:pointer;border-top:1px solid #232c38}tr.rw:hover{background:#1d2530}tr.dt td{background:#141a21;white-space:normal;padding:8px 12px;font-size:12px}
+.err{color:var(--y);font-size:12px;margin-bottom:6px}button{background:#3b82f6;color:#fff;border:0;border-radius:6px;padding:7px 12px}
+</style></head><body>
+<div class="top"><b>Nifty 50 Scanner</b><a href="/" style="color:#60a5fa">Options dashboard</a>
+<input id="tok" type="password" placeholder="Today's Upstox token" style="width:170px"><button onclick="saveTok()">Save</button>
+<select id="flt"><option value="all">All stocks</option><option value="bull">Bullish only</option><option value="bear">Bearish only</option></select>
+<select id="srt"><option value="score_d">Score: high to low</option><option value="score_a">Score: low to high</option>
+<option value="chg_d">Change: high to low</option><option value="chg_a">Change: low to high</option><option value="rvol">Volume spike first</option></select>
+<span class="mut" id="stamp"></span><a href="/logout" class="mut" style="margin-left:auto">Log out</a></div>
+<div class="err" id="err"></div>
+<div class="grid" id="sum"></div>
+<div class="card" style="margin-top:10px;overflow-x:auto"><table id="tb"></table></div>
+<p class="mut" style="font-size:11px">Scores use completed 5-minute candles (7 checks: EMA trend, RSI, VWAP, Supertrend 10/3, Bollinger 20/2, previous day high/low, volume vs same time on earlier days). Tap a row for the reasons. Outside market hours it shows the last session. Decision support only, not advice.</p>
+<script>
+const $=id=>document.getElementById(id);let D=null,openS=new Set(),timer=null;
+function f(n,d=0){return n==null?'-':Number(n).toLocaleString('en-IN',{maximumFractionDigits:d})}
+function cls(n){return n>0?'g':n<0?'r':''}
+function sg(r){const s=r.score;return s>=6?['STRONG BULL','g']:s>=4?['BULL','g']:s<=-6?['STRONG BEAR','r']:s<=-4?['BEAR','r']:['NEUTRAL','y']}
+function render(){
+ if(!D||!D.rows)return;const s=D.summary;
+ $('sum').innerHTML=`<div class="card"><h3>Stocks scored</h3><div class="big">${s.n}</div><div class="mut">${D.missing&&D.missing.length?'Not found: '+D.missing.join(', '):'All 50 matched'}</div></div>
+ <div class="card"><h3>Bull / Neutral / Bear</h3><div class="big"><span class="g">${s.bull}</span> / <span class="y">${s.neutral}</span> / <span class="r">${s.bear}</span></div><div class="mut">Bull = score +4 or more</div></div>
+ <div class="card"><h3>Above VWAP</h3><div class="big">${s.above_vwap}%</div><div class="mut">Supertrend up: ${s.st_up}%</div></div>
+ <div class="card"><h3>Advancing / declining</h3><div class="big"><span class="g">${s.adv}</span> / <span class="r">${s.dec}</span></div><div class="mut">vs previous close</div></div>
+ <div class="card" style="grid-column:1/-1"><h3>Breadth read</h3>${s.read}</div>`;
+ let rows=D.rows.slice();const fl=$('flt').value;
+ if(fl==='bull')rows=rows.filter(r=>r.score>=4);else if(fl==='bear')rows=rows.filter(r=>r.score<=-4);
+ const key={score_d:r=>-r.score,score_a:r=>r.score,chg_d:r=>-r.chg,chg_a:r=>r.chg,rvol:r=>-(r.rvol||0)}[$('srt').value];
+ rows.sort((a,b)=>key(a)-key(b));
+ let h='<tr><th style="text-align:left">Stock</th><th>LTP</th><th>Chg %</th><th>Score</th><th>Signal</th><th>VWAP</th><th>Supertrend</th><th>BB %B</th><th>Vol</th><th>RSI</th></tr>';
+ for(const r of rows){const [t,c]=sg(r);
+  h+=`<tr class="rw" data-s="${r.sym}"><td style="text-align:left"><b>${r.sym}</b></td><td>${f(r.ltp,2)}</td><td class="${cls(r.chg)}">${f(r.chg,2)}</td>
+  <td><b class="${cls(r.score)}">${r.score>0?'+':''}${r.score}</b></td><td class="${c}">${t}</td>
+  <td class="${cls(r.vside)}">${r.vside>0?'above':r.vside<0?'below':'at'} ${f(Math.abs(r.vwap_pct),2)}%</td>
+  <td class="${cls(r.st)}">${r.st>0?'Up':'Down'}${r.flip?' (new)':''}</td>
+  <td>${f(r.pctb*100)}%${r.squeeze?' SQZ':''}</td><td>${r.rvol==null?'-':f(r.rvol,1)+'x'}</td><td>${f(r.rsi)}</td></tr>`;
+  if(openS.has(r.sym))h+=`<tr class="dt"><td colspan="10" style="text-align:left">`+
+   r.why.map(w=>`<div><b class="${cls(w[0])}">${w[0]>0?'+':''}${w[0]}</b> ${w[1]}</div>`).join('')+
+   `<div class="mut" style="margin-top:6px">VWAP ${f(r.vwap,2)} | EMA9 ${f(r.e9,2)} / EMA21 ${f(r.e21,2)} | Supertrend ${f(r.st_val,2)} | Bollinger ${f(r.bb[0],2)} / ${f(r.bb[1],2)} / ${f(r.bb[2],2)} | Prev day high ${f(r.pdh,2)} low ${f(r.pdl,2)}</div></td></tr>`;
+ }
+ $('tb').innerHTML=h}
+$('tb').addEventListener('click',e=>{const tr=e.target.closest('tr.rw');if(!tr)return;const s=tr.dataset.s;openS.has(s)?openS.delete(s):openS.add(s);render()});
+$('flt').addEventListener('change',render);$('srt').addEventListener('change',render);
+async function saveTok(){const t=$('tok').value.trim();if(!t)return;
+ try{await fetch('/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:t})});$('tok').value='';load()}catch(e){$('err').textContent=String(e)}}
+async function load(){clearTimeout(timer);
+ try{const r=await fetch('/api/scan');if(r.status===401){location='/login';return}
+  const d=await r.json();if(d.rows){D=d;render()}
+  $('err').textContent=(d.errors||[]).join(' | ');
+  $('stamp').textContent=d.running?(d.progress||'Scanning...'):(d.asof?'Updated '+d.asof+' | last candle '+d.last_candle+' | session '+d.session:'');
+  timer=setTimeout(load,d.running?3000:(d.rows?30000:10000))
+ }catch(e){$('err').textContent=String(e);timer=setTimeout(load,10000)}}
+load();
+</script></body></html>"""
+
+
+@app.route("/scanner")
+def scanner_page():
+    return Response(SCAN_HTML, mimetype="text/html")
 
 
 @app.route("/")
