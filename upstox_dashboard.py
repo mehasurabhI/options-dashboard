@@ -118,15 +118,58 @@ def rsi(c, n=14):
     return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
 
 
+def probe_expiry(key, today_d):
+    """Fallback when /option/contract is refused: try upcoming weekdays on /option/chain."""
+    for i in range(0, 15):
+        d = today_d + dt.timedelta(days=i)
+        if d.weekday() >= 5:
+            continue
+        try:
+            data = api("/option/chain", {"instrument_key": key, "expiry_date": d.isoformat()})
+        except RuntimeError as e:
+            if any(x in str(e) for x in ("HTTP 401", "HTTP 403", "HTTP 429")):
+                raise
+            continue  # not an expiry date
+        if data:
+            return [d.isoformat()]
+    return []
+
+
 def nearest_expiry(key):
-    today = dt.datetime.now(IST).date().isoformat()
+    today_d = dt.datetime.now(IST).date()
+    today = today_d.isoformat()
     if _expiry_cache.get(key, (None, None))[0] != today:
-        data = api("/option/contract", {"instrument_key": key})
-        exps = sorted({str(c["expiry"])[:10] for c in data})
-        _expiry_cache[key] = (today, exps)
-    exps = _expiry_cache[key][1]
+        try:
+            data = api("/option/contract", {"instrument_key": key})
+            exps = sorted({str(c["expiry"])[:10] for c in data})
+        except Exception:
+            exps = probe_expiry(key, today_d)
+        if exps:
+            _expiry_cache[key] = (today, exps)
+    exps = _expiry_cache.get(key, (None, []))[1]
     upcoming = [e for e in exps if e >= today]
-    return upcoming[0] if upcoming else None, upcoming[:4]
+    return (upcoming[0] if upcoming else None), upcoming[:4]
+
+
+def vix_quote():
+    try:
+        q = api("/market-quote/quotes", {"instrument_key": VIX_KEY})
+        v = list(q.values())[0]
+        return {"ltp": v.get("last_price"), "chg": v.get("net_change")}
+    except Exception:
+        # fallback: build it from candles (these calls work with the token)
+        k = quote(VIX_KEY, safe="")
+        today = dt.datetime.now(IST).date()
+        ic = (api(f"/historical-candle/intraday/{k}/1minute") or {}).get("candles", [])
+        dc = (api(f"/historical-candle/{k}/day/{today}/{today - dt.timedelta(days=10)}") or {}).get("candles", [])
+        past = [c for c in dc if c[0][:10] < today.isoformat()]  # newest first
+        if ic:
+            ltp, prev = ic[0][4], (past[0][4] if past else None)
+        elif len(past) > 1:
+            ltp, prev = past[0][4], past[1][4]
+        else:
+            raise RuntimeError("no VIX candles")
+        return {"ltp": ltp, "chg": (ltp - prev) if prev is not None else None}
 
 
 def candles_5m(key):
@@ -194,9 +237,7 @@ def data():
 
     # VIX
     try:
-        q = api("/market-quote/quotes", {"instrument_key": VIX_KEY})
-        v = list(q.values())[0]
-        out["vix"] = {"ltp": v.get("last_price"), "chg": v.get("net_change")}
+        out["vix"] = vix_quote()
     except Exception as e:
         out["errors"].append("VIX: " + str(e))
 
@@ -424,6 +465,39 @@ async function load(){try{const r=await fetch('/api/data?index='+$('idx').value)
  if(r.status===401){location='/login';return}render(await r.json())}catch(e){$('err').textContent=String(e)}}
 $('idx').addEventListener('change',load);load();setInterval(load,10000);
 </script></body></html>"""
+
+
+@app.route("/diag")
+def diag():
+    key = INDEXES["NIFTY"]
+    k = quote(key, safe="")
+    today = dt.datetime.now(IST).date()
+
+    def chain():
+        exp, _ = nearest_expiry(key)
+        if not exp:
+            raise RuntimeError("no expiry found")
+        d = api("/option/chain", {"instrument_key": key, "expiry_date": exp})
+        return f"{len(d)} strikes, expiry {exp}"
+
+    tests = [
+        ("Option contracts  /option/contract", lambda: api("/option/contract", {"instrument_key": key})),
+        ("Option chain  /option/chain", chain),
+        ("Market quote v2  /market-quote/quotes", lambda: api("/market-quote/quotes", {"instrument_key": VIX_KEY})),
+        ("Candles v2 intraday", lambda: api(f"/historical-candle/intraday/{k}/1minute")),
+        ("Candles v2 daily", lambda: api(f"/historical-candle/{k}/day/{today}/{today - dt.timedelta(days=10)}")),
+        ("Candles v3 intraday 5m", lambda: api(f"/historical-candle/intraday/{k}/minutes/5", base=BASE3)),
+    ]
+    lines = [f"Token: {'not set' if not TOKEN else 'length ' + str(len(TOKEN)) + ', starts with ' + TOKEN[:3]}", ""]
+    for name, fn in tests:
+        try:
+            r = fn()
+            lines.append(f"OK    {name}" + (f"  ({r})" if isinstance(r, str) else ""))
+        except Exception as e:
+            lines.append(f"FAIL  {name}\n      {str(e)[:220]}")
+    body = "<pre style='background:#0f1318;color:#e6e9ee;padding:16px;white-space:pre-wrap;font:13px monospace'>" + \
+        "\n".join(lines).replace("<", "&lt;") + "</pre><p style='color:#8b95a3;font:13px system-ui'><a href='/'>Back</a></p>"
+    return Response(body, mimetype="text/html")
 
 
 # ======================= Nifty 50 scanner =======================
